@@ -1,0 +1,214 @@
+# ==============================================================================
+# 在 GitHub Actions 上构建镜像，并推送到 GitHub Container Registry（GHCR）
+#
+# 和 docker-publish.yml 的区别只有「推到哪个 registry」：
+#   · docker-publish.yml     -> Docker Hub，需要仓库里预先配好
+#                               DOCKERHUB_USERNAME / DOCKERHUB_TOKEN 两个 secret；
+#   · 本工作流（ghcr-publish）-> GHCR，只用 Actions 自带的 GITHUB_TOKEN，
+#                               不需要任何手工配置的 secret，fork 出来的仓库
+#                               开箱即用，整个流程完全不碰 Docker Hub。
+#
+# 镜像地址：ghcr.io/<owner>/wxcode-yyb-fusion
+#   部署时在 .env 里填：IMAGE_REPO=ghcr.io/<owner>/wxcode-yyb-fusion
+#   标签规则与 Docker Hub 那份完全一致（latest + v<N>），两边同名同标签，
+#   区别只是 registry 前缀，固定版本 / 回滚照旧改 .env 里的 IMAGE_TAG=v<N>。
+#
+# ⚠️ GHCR 上的包默认是 private。要在别的机器 docker pull，二选一：
+#      ① 仓库（或个人主页）→ Packages → 选中该包 → Package settings
+#         → Change visibility → Public；
+#      ② docker login ghcr.io -u <GitHub 用户名> -p <带 read:packages 的 PAT>。
+#
+# ⚠️ 同一次 push 上两个流水线会各构建一次（Docker Hub 一份、GHCR 一份）。
+#    只想留 GHCR 时，把 docker-publish.yml 的 on: 触发器注释掉即可；
+#    本文件既不依赖它、也不修改它。
+#
+# ⚠️ 版本号规则与 docker-publish.yml 里的「计算本次版本号」步骤保持一致：
+#      ① 本次提交上已经有人工打的 v<N> / v<N>.<M> 标签 -> 直接沿用；
+#      ② 否则取全仓库最大主号 + 1。
+#    两条规则合起来保证「同一个提交在两个 registry 上算出同一个号」：
+#    即使 docker-publish.yml 先跑完并打上了 Git 标签，本工作流读到的也是
+#    规则①的那个号，不会各算各的。改编号规则时请两个文件一起改。
+#
+# ⚠️ 序号取自「现有 Git 标签的最大值 + 1」，别把作废的号留在仓库里，
+#    否则下一个号会跳号（清理方式见 README-DOCKER.md 的发布一节）。
+# ==============================================================================
+
+name: 构建并推送镜像到 GHCR（不依赖 Docker Hub）
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  # 允许在网页上手动触发，并可额外指定一个镜像标签
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: '额外要推送的镜像标签（可留空）'
+        required: false
+        default: ''
+
+# 串行化同一分支的构建，避免两次构建算出同一个版本序号
+concurrency:
+  group: docker-ghcr-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  IMAGE_NAME: wxcode-yyb-fusion
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read        # 只读代码：本工作流不打 Git 标签、不建 Release
+      packages: write       # 推镜像到 GHCR 需要
+    steps:
+      - name: 拉取代码（含全部标签，用于计算版本序号）
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 校验双架构预编译二进制已入库
+        run: |
+          set -euo pipefail
+          for arch in amd64 arm64; do
+            f="gateway/yyb-go-${arch}"
+            if [ ! -f "$f" ]; then
+              echo "::error::缺少 $f —— 请先在本机运行 ./build-gateway.sh 并提交产物"
+              exit 1
+            fi
+            head -c 4 "$f" | od -An -tx1 | tr -d ' \n' | grep -q '^7f454c46' \
+              || { echo "::error::$f 不是 ELF 文件"; exit 1; }
+            echo "  ok  $f  ($(du -h "$f" | cut -f1))"
+          done
+
+      - name: 校验面板资源（templates/static）与 src 一致
+        # 与 docker-publish.yml 的同名步骤同因同理：Dockerfile 只 COPY
+        # gateway/resource，而面板前端是在 src/resource 下开发的，漏同步会让
+        # 镜像里跑旧页面、而构建却「成功」。这里再挡一道，避免把旧页面推到 GHCR。
+        # 比较用 git 归一化后的 blob 哈希，与检出环境无关（原因见 docker-publish.yml）。
+        run: |
+          set -euo pipefail
+          fail=0
+          for pair in templates static; do
+            while IFS= read -r -d '' f; do
+              rel="${f#src/resource/$pair/}"
+              g="gateway/resource/$pair/$rel"
+              if [ ! -f "$g" ]; then
+                echo "::error::缺少 gateway/resource/$pair/$rel —— 镜像会缺页面。"
+                fail=1
+                continue
+              fi
+              if [ "$(git hash-object -- "$f")" != "$(git hash-object -- "$g")" ]; then
+                echo "::error::内容不一致：$pair/$rel"
+                fail=1
+              fi
+            done < <(find "src/resource/$pair" -type f -print0 | sort -z)
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::gateway/resource 与 src/resource 不一致 —— 镜像会打包旧页面。"
+            echo "::error::请在本机执行下面两条命令同步后提交："
+            echo "::error::  cp -r src/resource/templates/. gateway/resource/templates/"
+            echo "::error::  cp -r src/resource/static/.    gateway/resource/static/"
+            exit 1
+          fi
+          echo "  ok  gateway/resource 与 src/resource 内容一致"
+
+      - name: 计算镜像地址（GHCR 路径要求全小写）
+        id: img
+        run: echo "image=ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/${IMAGE_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: 准备 QEMU（用于跨架构构建）
+        uses: docker/setup-qemu-action@v3
+
+      - name: 准备 Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: 登录 GHCR（用自带的 GITHUB_TOKEN，无需额外 secret）
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 计算本次版本号
+        id: ver
+        run: |
+          set -uo pipefail
+          git fetch --tags --force --quiet 2>/dev/null || true
+
+          # ① 本次提交上如果已经有人工打的版本标签，就直接沿用（与 Docker Hub 那份同规则）
+          PINNED=$(git tag --points-at "${GITHUB_SHA}" \
+                     | grep -E '^v[0-9]+(\.[0-9]+)?$' | sort -V | tail -1 || true)
+          if [ -n "${PINNED}" ]; then
+            VERSION="${PINNED}"
+            NOTE="取自本次提交上的标签（人工指定的发布号）"
+          else
+            # ② 没有指定就自动递增：全仓库最大主号 + 1，永不按天重置、永不复用。
+            #    兼容 v<N>、v<N>.<M> 与历史遗留的 SHA-<月日>-V<n>.<m>。
+            MAX=$(git tag -l | sed -nE \
+                    -e 's/^v([0-9]+)(\.[0-9]+)?$/\1/p' \
+                    -e 's/^SHA-[0-9]{4}-V([0-9]+)\.[0-9]+$/\1/p' \
+                  | sort -n | tail -1)
+            MAX=${MAX:-0}
+            VERSION="v$((MAX + 1))"
+            NOTE="全局第 $((MAX + 1)) 号发布；序号单调递增，取自本仓库 Git 标签"
+          fi
+
+          echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "### 本次版本：\`${VERSION}\`" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "（${NOTE}）" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: 生成镜像标签与元数据（latest / 可选自定义标签）
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ steps.img.outputs.image }}
+          tags: |
+            # 默认分支构建 -> latest
+            type=raw,value=latest,enable={{is_default_branch}}
+            # 正式版本号 v<N> 由「构建并推送」步骤直接拼上，这里不再生成，
+            # 以保证 GHCR 上只有 latest 和 v<N> 两种标签，与 Docker Hub 完全对齐。
+            # 网页手动触发时可额外附加一个自定义标签（可留空）
+            type=raw,value=${{ github.event.inputs.tag }},enable=${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag != '' }}
+
+      - name: 构建并推送
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          # 两个架构都要：Dockerfile 只是 COPY 预编译二进制，多架构几乎不增加构建时间
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.tags }}
+            ${{ steps.img.outputs.image }}:${{ steps.ver.outputs.version }}
+          # 把本次版本号烧进镜像：登录页显示的「当前版本」读的就是它
+          # （对应 Dockerfile 的 ARG VERSION），所以发版不必再改登录页
+          build-args: |
+            VERSION=${{ steps.ver.outputs.version }}
+          # metadata-action 默认就带 org.opencontainers.image.source，
+          # GHCR 靠它把这个包关联到本仓库
+          labels: ${{ steps.meta.outputs.labels }}
+          # 复用构建缓存，后续构建只需 1-2 分钟
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: 输出镜像地址
+        run: |
+          {
+            echo "### 镜像已推送到 GHCR :package:"
+            echo ""
+            echo '```'
+            echo "${{ steps.img.outputs.image }}:${{ steps.ver.outputs.version }}"
+            echo "${{ steps.img.outputs.image }}:latest"
+            echo '```'
+            echo ""
+            echo "摘要：\`${{ steps.build.outputs.digest }}\`"
+            echo ""
+            echo "部署时在项目 .env 里填：\`IMAGE_REPO=${{ steps.img.outputs.image }}\`"
+            echo ""
+            echo "⚠️ 包默认 private：要公开拉取，去 Packages → 该包 → Package settings 改可见性。"
+          } >> "$GITHUB_STEP_SUMMARY"
